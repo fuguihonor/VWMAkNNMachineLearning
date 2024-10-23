@@ -1,0 +1,165 @@
+//@version=5
+strategy("VWMA with kNN Machine Learning: MFI/ADX by lastguru", shorttitle="VWMA + kNN: MFI/ADX", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=100)
+
+/////////
+// kNN //
+/////////
+
+// Define storage arrays for: parameter 1, parameter 2, price, result (up = 1; down = -1)
+var float[] knn1 = array.new_float(1, 0)
+var float[] knn2 = array.new_float(1, 0)
+var float[] knnp = array.new_float(1, 0)
+var float[] knnr = array.new_float(1, 0)
+
+// Store the previous trade; buffer the current one until results are in
+_knnStore(float p1, float p2, float src) =>
+    var float prevp1 = 0.0
+    var float prevp2 = 0.0
+    var float prevsrc = 0.0
+    
+    array.push(knn1, prevp1)
+    array.push(knn2, prevp2)
+    array.push(knnp, prevsrc)
+    array.push(knnr, src >= prevsrc ? 1.0 : -1.0)
+    
+    prevp1 := p1
+    prevp2 := p2
+    prevsrc := src
+
+// Get neighbours by getting k smallest distances from the distance array, and then getting all results with these distances
+_knnGet(float[] arr1, float[] arr2, int k) =>
+    float[] sarr = array.copy(arr1)
+    array.sort(sarr)
+    float[] ss = array.slice(sarr, 0, math.min(k, array.size(sarr)))
+    float m = array.max(ss)
+    float[] out = array.new_float(0)
+    for i = 0 to array.size(arr1) - 1
+        if array.get(arr1, i) <= m
+            array.push(out, array.get(arr2, i))
+    out
+
+// Create a distance array from the two given parameters
+_knnDistance(float p1, float p2) =>
+    float[] dist = array.new_float(0)
+    int n = array.size(knn1) - 1
+    for i = 0 to n
+        float d = math.sqrt(math.pow(p1 - array.get(knn1, i), 2) + math.pow(p2 - array.get(knn2, i), 2))
+        array.push(dist, d)
+    dist
+
+// Make a prediction, finding k nearest neighbours
+_knn(float p1, float p2, int k) =>
+    float[] slice = _knnGet(_knnDistance(p1, p2), array.copy(knnr), k)
+    float knn = array.sum(slice)
+    knn
+
+////////////
+// Inputs //
+////////////
+
+SRC = input.source(title="Source", defval=open)
+FAST = input.int(title="Fast Length", defval=13, minval=1)
+SLOW = input.int(title="Slow Length", defval=19, minval=1)
+APPLY = input.bool(title="Apply kNN filter", defval=true)
+FILTER = input.int(title="Filter Length", defval=13, minval=1)
+SMOOTH = input.int(title="Filter Smoothing", defval=6, minval=1)
+KNN = input.int(title="kNN nearest neighbors (k)", defval=45, minval=1)
+DIST = input.int(title="kNN minimum difference", defval=2, minval=0)
+BACKGROUND = input.bool(title="Draw background", defval=false)
+
+////////
+// MA //
+////////
+fastMA = ta.vwma(SRC, FAST)
+slowMA = ta.vwma(SRC, SLOW)
+
+/////////
+// DMI //
+/////////
+
+// Wilder's Smoothing (Running Moving Average)
+_rma(float src, int length) =>
+    float out = 0.0
+    out := ((length - 1) * nz(out[1]) + src) / length
+
+// DMI (Directional Movement Index)
+_dmi(int len, int smooth) =>
+    float up = ta.change(high)
+    float down = -ta.change(low)
+    
+    float plusDM = 0.0
+    float minusDM = 0.0
+    
+    if na(up)
+        plusDM := na
+    else if up > down and up > 0
+        plusDM := up
+    else
+        plusDM := 0
+        
+    if na(down)
+        minusDM := na
+    else if down > up and down > 0
+        minusDM := down
+    else
+        minusDM := 0
+    
+    float trur = _rma(ta.tr, len)
+    float plus_dm = _rma(plusDM, len)
+    float minus_dm = _rma(minusDM, len)
+    
+    float plus = 100 * plus_dm / trur
+    float minus = 100 * minus_dm / trur
+    
+    plus := nz(plus, 0)
+    minus := nz(minus, 0)
+    
+    float sum = plus + minus
+    float adx = 100 * _rma(math.abs(plus - minus) / (sum == 0 ? 1 : sum), smooth)
+    
+    [plus, minus, adx]
+
+[diplus, diminus, adx] = _dmi(FILTER, SMOOTH)
+
+/////////
+// MFI //
+/////////
+
+// common RSI function
+_rsi(float upper, float lower) =>
+    float result = 0.0
+    if lower == 0
+        result := 100
+    else if upper == 0
+        result := 0
+    else
+        result := 100.0 - (100.0 / (1.0 + upper / lower))
+    result
+
+float mfiUp = math.sum(volume * (ta.change(ohlc4) <= 0 ? 0 : ohlc4), FILTER)
+float mfiDown = math.sum(volume * (ta.change(ohlc4) >= 0 ? 0 : ohlc4), FILTER)
+float mfi = _rsi(mfiUp, mfiDown)
+
+////////////
+// Filter //
+////////////
+
+bool longCondition = ta.crossover(fastMA, slowMA)
+bool shortCondition = ta.crossunder(fastMA, slowMA)
+
+if longCondition or shortCondition
+    _knnStore(adx, mfi, SRC)
+float filter = _knn(adx, mfi, KNN)
+
+/////////////
+// Actions //
+/////////////
+
+bgcolor(BACKGROUND ? filter >= 0 ? color.new(color.green, 0) : color.new(color.red, 0) : na)
+plot(fastMA, color=color.new(color.red, 0))
+plot(slowMA, color=color.new(color.green, 0))
+
+if longCondition and (not APPLY or filter >= DIST)
+    strategy.entry("Long", strategy.long)
+if shortCondition and (not APPLY or filter <= -DIST)
+    strategy.entry("Short", strategy.short)
